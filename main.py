@@ -1,192 +1,207 @@
+import asyncio
+import json
+import time
+import webbrowser
+import aiofiles  # 非同期ファイル操作用
 from CHRLINE import CHRLINE
-from datetime import datetime, timedelta
 
-# クライアントの初期化とログイン
+# CHRLINEクライアントのインスタンス作成（QRコードログイン）
 client = CHRLINE()
-client.loginWithCredential('your_email@example.com', 'your_password')
 
-# グローバル変数
-blacklist = []
-whitelist = []
-invite_count = {}  # {user_id: invite_count}
-group_ids = []
-message_history = {}  # {user_id: [message_time1, message_time2, ...]}
+# ファイルの保存処理用フラグ
+save_pending = {"blacklist": False, "whitelist": False, "logs": False}
 
-# アカウントが参加しているグループのIDを取得
-def get_all_group_ids():
-    global group_ids
-    group_ids = client.getGroupIdsJoined()
-    print(f"参加しているグループ: {group_ids}")
-
-# グループの監視
-def monitor_groups():
-    for group_id in group_ids:
-        monitor_group(group_id)
-
-# 特定のグループの監視
-def monitor_group(group_id):
-    messages = client.getRecentMessages(group_id)
-    for msg in messages:
-        sender_id = msg['senderId']
-        text = msg['text']
-
-        # スパム検出
-        if is_spamming(sender_id, text):
-            add_to_blacklist(group_id, sender_id)
-            client.deleteMessage(group_id, msg['id'])
-            client.sendMessage(group_id, f"{msg['senderName']} が連投を検知したため削除しました。")
-
-        # オールメンション検出
-        if detect_all_mention(text) and sender_id not in whitelist:
-            add_to_blacklist(group_id, sender_id)
-            client.deleteMessage(group_id, msg['id'])
-            client.sendMessage(group_id, f"{msg['senderName']} のオールメンションは禁止されています。")
-
-        # 招待検出
-        if is_invite_action(msg):
-            handle_invite_action(group_id, msg)
-
-# スパム検出（同じメッセージが5回以上連続した場合）
-def is_spamming(user_id, text):
-    now = datetime.now()
-
-    # メッセージ履歴に追加
-    if user_id not in message_history:
-        message_history[user_id] = []
-
-    message_history[user_id].append(now)
-
-    # 2分以内のメッセージ数が5回を超えたらスパムと判断
-    recent_messages = [msg_time for msg_time in message_history[user_id] if now - msg_time < timedelta(minutes=2)]
-
-    if len(recent_messages) > 5:
-        return True
-
-    message_history[user_id] = recent_messages
-    return False
-
-# オールメンション検出
-def detect_all_mention(text):
-    # ここでメンションの特定ロジックを実装する必要があります。
-    # 例として、@all や特定のキーワードを検出する実装を考慮。
-    return '@all' in text
-
-# 招待アクションかどうかを確認
-def is_invite_action(msg):
-    return msg.get('contentType') == 'INVITE'
-
-# 招待アクションの処理
-def handle_invite_action(group_id, msg):
-    inviter_id = msg['senderId']
-    
-    # 招待されたユーザーが自分（アカウント自身）の場合、自動的に参加
-    invitee_id = msg['inviteeId']
-    if invitee_id == client.profile['mid']:  # 自分が招待されたか確認
-        client.acceptGroupInvitation(group_id)
-        client.sendMessage(group_id, "招待されたため、自動的にグループに参加しました。")
-
-    # ホワイトリストに含まれていないユーザーが招待した場合
-    elif inviter_id not in whitelist:
-        # ホワイトリストに入っていない場合は招待をキャンセル
-        cancel_invite(group_id, invitee_id)
-        client.sendMessage(group_id, f"{msg['senderName']} さんの招待はキャンセルされました。")
-
-# 招待をキャンセルする
-def cancel_invite(group_id, invitee_id):
-    client.cancelGroupInvitation(group_id, [invitee_id])
-
-# コマンドの処理
-def process_command(sender_id, group_id, text):
-    if sender_id not in whitelist:
-        client.sendMessage(group_id, "このコマンドを使用する権限がありません。")
-        return
-
-    if text == '/help':
-        client.sendMessage(group_id, """
-        利用可能なコマンド:
-        /help - コマンド一覧を表示
-        /bkl - ブラックリストを表示
-        /whl - ホワイトリストを表示
-        /bk - ブラックリストに追加
-        /bkc - ブラックリストから削除
-        /wh - ホワイトリストに追加
-        /whc - ホワイトリストから削除
-        """)
-
-    elif text == '/bkl':
-        blacklist_display = '\n'.join([client.getContact(uid)['displayName'] for uid in blacklist])
-        client.sendMessage(group_id, f"ブラックリスト:\n{blacklist_display}")
-
-    elif text == '/whl':
-        whitelist_display = '\n'.join([client.getContact(uid)['displayName'] for uid in whitelist])
-        client.sendMessage(group_id, f"ホワイトリスト:\n{whitelist_display}")
-
-    elif text == '/bk':
-        contact = get_last_sent_contact(group_id)
-        if contact:
-            add_to_blacklist(group_id, contact['mid'])
+# 非同期ファイル保存関数
+async def save_to_file(data, filename, immediate=False):
+    try:
+        if not immediate:
+            save_pending[filename] = True
         else:
-            client.sendMessage(group_id, "連絡先が見つかりません。")
+            async with aiofiles.open(filename, "w") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=4))
+            save_pending[filename] = False
+    except Exception as e:
+        print(f"ファイル保存エラー: {filename} - {str(e)}")
 
-    elif text == '/bkc':
-        contact = get_last_sent_contact(group_id)
-        if contact and contact['mid'] in blacklist:
-            remove_from_blacklist(group_id, contact['mid'])
-        else:
-            client.sendMessage(group_id, "ブラックリストにそのメンバーはいません。")
+# 非同期ファイル読み込み関数
+async def load_from_file(filename):
+    try:
+        async with aiofiles.open(filename, "r") as f:
+            content = await f.read()
+            return json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"エラー: {filename} の読み込み中にエラーが発生しました。")
+        return {}
 
-    elif text == '/wh':
-        contact = get_last_sent_contact(group_id)
-        if contact and contact['mid'] not in blacklist:
-            add_to_whitelist(group_id, contact['mid'])
-        else:
-            client.sendMessage(group_id, "ブラックリストにいるメンバーはホワイトリストに追加できません。")
+# データ初期化
+blacklist = set(await load_from_file("blacklist.json").get("blacklist", []))
+whitelist = set(await load_from_file("whitelist.json").get("whitelist", []))
+logs = await load_from_file("logs.json")
+invite_count = {}  # 招待回数の管理
+message_history = {}  # スパム検出用
+admin_ids = set(whitelist)  # 管理者IDのセット
+error_log_file = "error_log.json"
 
-    elif text == '/whc':
-        contact = get_last_sent_contact(group_id)
-        if contact and contact['mid'] in whitelist:
-            remove_from_whitelist(group_id, contact['mid'])
-        else:
-            client.sendMessage(group_id, "ホワイトリストにそのメンバーはいません。")
+# QRコードログイン処理
+async def qr_login():
+    print("QRコードを取得しています...")
+    url = client.getAuthQRCode()  # 認証用QRコードのURLを取得
+    print(f"次のURLをQRコードリーダーでスキャンしてください:\n{url}")
+    webbrowser.open(url)  # OS依存しない方法でURLを開く
 
-# 最後に送信された連絡先を取得
-def get_last_sent_contact(group_id):
-    # 最新のメッセージを取得して、連絡先メッセージを抽出
-    messages = client.getRecentMessages(group_id)
-    for msg in reversed(messages):  # 最新のメッセージからチェック
-        if msg['contentType'] == 'CONTACT':
-            return msg['contentMetadata']  # 連絡先のメタデータを返す
-    return None
+# ホワイトリストユーザーによる自動管理開始
+async def on_invited_to_group(op):
+    group_id = op["groupId"]
+    inviter_id = op["param3"]
 
-# ブラックリストに追加
-def add_to_blacklist(group_id, user_id):
-    if user_id not in blacklist:
-        blacklist.append(user_id)
-        user_name = client.getContact(user_id)['displayName']
-        client.sendMessage(group_id, f"{user_name} をブラックリストに追加しました。")
+    if inviter_id in whitelist:
+        await client.sendMessage(group_id, "ホワイトリストの管理者による招待を確認しました。管理を開始します。")
 
-# ブラックリストから削除
-def remove_from_blacklist(group_id, user_id):
-    if user_id in blacklist:
-        blacklist.remove(user_id)
-        user_name = client.getContact(user_id)['displayName']
-        client.sendMessage(group_id, f"{user_name} をブラックリストから削除しました。")
+# 新しいメンバーがグループに参加したとき
+async def on_member_joined(group_id, new_members):
+    for member in new_members:
+        user_name = await client.getDisplayName(member)
+        await client.sendMessage(group_id, f"@{user_name} さん、参加ありがとうございます！", [member])
 
-# ホワイトリストに追加
-def add_to_whitelist(group_id, user_id):
-    if user_id not in whitelist:
-        whitelist.append(user_id)
-        user_name = client.getContact(user_id)['displayName']
-        client.sendMessage(group_id, f"{user_name} をホワイトリストに追加しました。")
+# メンバーが退会したとき
+async def on_member_left(group_id, left_member):
+    user_name = await client.getDisplayName(left_member)
+    await client.sendMessage(group_id, f"@{user_name} さんが退会しました。ブロック・削除を推奨します。", [left_member])
 
-# ホワイトリストから削除
-def remove_from_whitelist(group_id, user_id):
-    if user_id in whitelist:
-        whitelist.remove(user_id)
-        user_name = client.getContact(user_id)['displayName']
-        client.sendMessage(group_id, f"{user_name} をホワイトリストから削除しました。")
+# 権限確認
+async def is_admin(user_id):
+    return user_id in admin_ids
 
-# メインループ
-if __name__ == '__main__':
-    get_all_group_ids()  # 参加しているグループIDを取得
-    monitor_groups()  # すべてのグループの監視を開始
+# スパム検出とコマンド処理
+async def on_message(message):
+    try:
+        group_id = message["group"]
+        user_id = message["user"]
+        text = message["text"]
+        sender_name = await client.getDisplayName(user_id)
+        current_time = time.time()
+
+        # グループ内の招待回数初期化
+        if group_id not in invite_count:
+            invite_count[group_id] = {}
+        if user_id not in invite_count[group_id]:
+            invite_count[group_id][user_id] = 0
+
+        # グループごとのログ管理
+        if group_id not in logs:
+            logs[group_id] = []
+        logs[group_id].append(f"{sender_name}: {text}")
+        await save_to_file(logs, "logs.json")
+
+        # スパムメッセージ履歴管理
+        if group_id not in message_history:
+            message_history[group_id] = {}
+        if user_id not in message_history[group_id]:
+            message_history[group_id][user_id] = []
+
+        # 古いメッセージ削除（10秒以上経過したもの）
+        message_history[group_id][user_id] = [
+            t for t in message_history[group_id][user_id] if current_time - t < 10
+        ]
+        message_history[group_id][user_id].append(current_time)
+
+        # スパム検出（5件以上の短時間投稿）
+        if len(message_history[group_id][user_id]) > 5:
+            await client.kickoutFromGroup(group_id, [user_id])
+            blacklist.add(user_id)
+            await save_to_file({"blacklist": list(blacklist)}, "blacklist.json", immediate=True)
+            await client.sendMessage(group_id, f"{sender_name} がスパム検出され、グループから削除されました。")
+
+        # コマンド処理
+        if text.startswith("/"):
+            command = text.split()[0]
+
+            if command == "/help":
+                await client.sendMessage(
+                    group_id,
+                    """
+[コマンド一覧]
+/help - コマンド一覧を表示
+/addadmin @user - 管理者追加
+/deladmin @user - 管理者削除
+/bkl - ブラックリスト表示
+/bk @user - ブラックリスト追加
+/bkc @user - ブラックリストから削除
+/lg - グループログ表示
+/lgc - グループログ削除
+                    """
+                )
+
+            elif command == "/addadmin":
+                if not await is_admin(user_id):
+                    await client.sendMessage(group_id, "権限がありません。")
+                    return
+
+                mentions = message.get("mentions", [])
+                for mention in mentions:
+                    admin_ids.add(mention)
+                await save_to_file({"whitelist": list(admin_ids)}, "whitelist.json", immediate=True)
+                await client.sendMessage(group_id, "管理者を追加しました。")
+
+            elif command == "/deladmin":
+                if not await is_admin(user_id):
+                    await client.sendMessage(group_id, "権限がありません。")
+                    return
+
+                mentions = message.get("mentions", [])
+                for mention in mentions:
+                    admin_ids.discard(mention)
+                await save_to_file({"whitelist": list(admin_ids)}, "whitelist.json", immediate=True)
+                await client.sendMessage(group_id, "管理者を削除しました。")
+
+            elif command == "/bkl":
+                await client.sendMessage(group_id, f"ブラックリスト: {', '.join(blacklist)}")
+
+            elif command == "/bk":
+                mentions = message.get("mentions", [])
+                for mention in mentions:
+                    blacklist.add(mention)
+                await save_to_file({"blacklist": list(blacklist)}, "blacklist.json", immediate=True)
+                await client.sendMessage(group_id, "ユーザーをブラックリストに追加しました。")
+
+            elif command == "/bkc":
+                mentions = message.get("mentions", [])
+                for mention in mentions:
+                    blacklist.discard(mention)
+                await save_to_file({"blacklist": list(blacklist)}, "blacklist.json", immediate=True)
+                await client.sendMessage(group_id, "ユーザーをブラックリストから削除しました。")
+
+            elif command == "/lg":
+                await client.sendMessage(group_id, "\n".join(logs.get(group_id, [])))
+
+            elif command == "/lgc":
+                logs[group_id] = []
+                await save_to_file(logs, "logs.json", immediate=True)
+                await client.sendMessage(group_id, "ログをクリアしました。")
+
+    except Exception as e:
+        error_message = f"エラー: {e}"
+        await save_to_file({"error": error_message}, error_log_file, immediate=True)
+        print(error_message)
+
+# メイン処理
+async def main():
+    await qr_login()
+    while True:
+        try:
+            events = await client.poll.fetchOps()
+            for event in events:
+                if event.type == 25:  # メッセージイベント
+                    await on_message(event.message)
+                elif event.type == 13:  # グループ招待
+                    await on_invited_to_group(event)
+                elif event.type == 17:  # メンバー参加
+                    await on_member_joined(event.group, event.param1)
+                elif event.type == 15:  # メンバー退会
+                    await on_member_left(event.group, event.param1)
+        except Exception as e:
+            print(f"エラー: {e}")
+        await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
